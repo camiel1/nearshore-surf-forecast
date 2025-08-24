@@ -8,30 +8,96 @@ from datetime import datetime, timezone
 REALTIME_URL = "https://www.ndbc.noaa.gov/data/realtime2/{station}.txt"
 
 def parse_ndbc_realtime(txt: str) -> pd.DataFrame:
-    lines = [ln for ln in txt.splitlines() if ln.strip() and not ln.startswith("#")]
+    """
+    Parse NDBC realtime2 *.txt into a tidy DataFrame.
+
+    Robust to:
+      - Header line starting with '#'
+      - Year as 'YY' (2-digit) or 'YYYY' (4-digit)
+      - Optional minute column 'mm'
+      - Extra commented/unit lines before/after header
+    """
+    lines = [ln.rstrip("\n") for ln in txt.splitlines()]
     if not lines:
-        raise ValueError("No data lines found.")
-    header = lines[0].split()
-    rows = [ln.split() for ln in lines[1:]]
-    df = pd.DataFrame(rows, columns=header)
-    if all(k in df.columns for k in ["YY","MM","DD","hh","mm"]):
-        comp = dict(year=df["YY"].astype(int)+2000,
-                    month=df["MM"].astype(int),
-                    day=df["DD"].astype(int),
-                    hour=df["hh"].astype(int),
-                    minute=df["mm"].astype(int))
+        raise ValueError("Empty NDBC response.")
+
+    # 1) Locate the header line (allow it to start with '#')
+    header_idx = None
+    header_tokens = None
+    KNOWN_DATA_COLS = {"WDIR", "WSPD", "GST", "WVHT", "DPD", "APD", "MWD", "PRES", "ATMP", "WTMP", "DEWP", "VIS", "PTDY", "TIDE"}
+    for i, ln in enumerate(lines[:80]):  # look near the top
+        s = ln.strip()
+        if not s:
+            continue
+        toks = s.lstrip("#").split()
+        has_date = (("YY" in toks or "YYYY" in toks) and "MM" in toks and "DD" in toks and ("hh" in toks or "HH" in toks))
+        has_data = any(t in toks for t in KNOWN_DATA_COLS)
+        if has_date and has_data:
+            header_idx = i
+            header_tokens = toks
+            break
+    if header_idx is None:
+        raise ValueError("Could not find NDBC header line — unexpected file format.")
+
+    # 2) Collect data rows below the header; skip blank/comment lines
+    data_rows = []
+    for ln in lines[header_idx + 1:]:
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        toks = s.split()
+        if len(toks) == len(header_tokens):
+            data_rows.append(toks)
+    if not data_rows:
+        raise ValueError("No data rows found after header.")
+
+    # 3) Build DataFrame
+    df = pd.DataFrame(data_rows, columns=header_tokens)
+
+    # 4) Identify time columns
+    cols = set(df.columns)
+    year_col   = "YY" if "YY" in cols else ("YYYY" if "YYYY" in cols else None)
+    month_col  = "MM" if "MM" in cols else None
+    day_col    = "DD" if "DD" in cols else None
+    hour_col   = "hh" if "hh" in cols else ("HH" if "HH" in cols else None)
+    minute_col = "mm" if "mm" in cols else None  # optional
+    if not (year_col and month_col and day_col and hour_col):
+        raise ValueError(f"Unexpected NDBC time columns: {list(df.columns)}")
+
+    # 5) Build UTC timestamp (correctly handle 2-digit vs 4-digit years)
+    years_raw = pd.to_numeric(df[year_col], errors="coerce")
+    if year_col == "YY":
+        # If values look like 4-digit years (>=100), keep as-is. Otherwise pivot 2-digit to 2000+.
+        if (years_raw >= 100).any():
+            years = years_raw
+        else:
+            years = years_raw + 2000
     else:
-        comp = dict(year=df["YY"].astype(int)+2000,
-                    month=df["MM"].astype(int),
-                    day=df["DD"].astype(int),
-                    hour=df["hh"].astype(int),
-                    minute=0)
-    ts = pd.to_datetime(comp, utc=True, errors="coerce")
+        years = years_raw
+
+    months  = pd.to_numeric(df[month_col], errors="coerce")
+    days    = pd.to_numeric(df[day_col], errors="coerce")
+    hours   = pd.to_numeric(df[hour_col], errors="coerce")
+    minutes = pd.to_numeric(df[minute_col], errors="coerce") if minute_col else 0
+
+    ts = pd.to_datetime(
+        dict(year=years, month=months, day=days, hour=hours, minute=minutes),
+        errors="coerce", utc=True
+    )
     df.insert(0, "time_utc", ts)
+
+    # 6) Convert other columns to numeric where possible
     for col in df.columns:
-        if col != "time_utc":
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df.dropna(subset=["time_utc"]).reset_index(drop=True)
+        if col == "time_utc":
+            continue
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 7) Clean
+    df = df.dropna(subset=["time_utc"]).reset_index(drop=True)
+    return df
+
+
+
 
 def fetch_and_save(buoy_id: str, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
